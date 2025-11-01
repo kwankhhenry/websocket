@@ -1,0 +1,57 @@
+# Build directory
+build/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+!CMakeLists.txt
+Makefile
+
+# Compiled binaries
+*.a
+*.o
+*.so
+*.dylib
+*.exe
+bin/
+lib/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test executables (in build directory only)
+build/test_*
+build/benchmark
+
+# Example executables
+binance_ticker
+
+# Dependency directories (if any)
+deps/
+third_party/
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Coverage reports
+*.gcov
+*.gcda
+*.gcno
+coverage/
+
+# Valgrind output
+*.vglog
+
+# Core dumps
+core
+core.*
+
