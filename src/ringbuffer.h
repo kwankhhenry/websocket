@@ -38,6 +38,15 @@ size_t ringbuffer_readable(RingBuffer* rb);
 // Reset ring buffer (set read/write pointers to 0)
 void ringbuffer_reset(RingBuffer* rb);
 
+// Batch operations (HFT optimization: reduce function call overhead)
+// Write multiple chunks in a single call
+// Returns total bytes written
+size_t ringbuffer_batch_write(RingBuffer* rb, const void** data_array, size_t* len_array, size_t count);
+
+// Read multiple chunks in a single call
+// Returns total bytes read
+size_t ringbuffer_batch_read(RingBuffer* rb, void** data_array, size_t* len_array, size_t count);
+
 // Hot path: inline read (returns pointer and length directly)
 static inline void ringbuffer_read_inline(RingBuffer* rb, char** data, size_t* len) 
     __attribute__((always_inline));
@@ -46,10 +55,12 @@ static inline void ringbuffer_read_inline(RingBuffer* rb, char** data, size_t* l
 static inline void ringbuffer_write_inline(RingBuffer* rb, char** data, size_t* len) 
     __attribute__((always_inline));
 
-// Implementation of inline functions
+// Implementation of inline functions (with atomic operations for SPSC)
+// Note: Using GCC builtin atomics (__atomic_*) which don't require stdatomic.h
+
 static inline void ringbuffer_read_inline(RingBuffer* rb, char** data, size_t* len) {
-    size_t rp = rb->read_ptr;
-    size_t wp = rb->write_ptr;
+    size_t rp = __atomic_load_n(&rb->read_ptr, __ATOMIC_RELAXED);
+    size_t wp = __atomic_load_n(&rb->write_ptr, __ATOMIC_ACQUIRE);
     
     if (wp >= rp) {
         *len = wp - rp;
@@ -61,8 +72,8 @@ static inline void ringbuffer_read_inline(RingBuffer* rb, char** data, size_t* l
 }
 
 static inline void ringbuffer_write_inline(RingBuffer* rb, char** data, size_t* len) {
-    size_t rp = rb->read_ptr;
-    size_t wp = rb->write_ptr;
+    size_t rp = __atomic_load_n(&rb->read_ptr, __ATOMIC_ACQUIRE);
+    size_t wp = __atomic_load_n(&rb->write_ptr, __ATOMIC_RELAXED);
     
     if (wp >= rp) {
         *len = rb->size - wp;

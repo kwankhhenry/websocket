@@ -9,6 +9,9 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
 
 int io_init(IOContext* ctx) {
     if (!ctx) {
@@ -26,6 +29,15 @@ int io_init(IOContext* ctx) {
     // Pin thread to E-core for efficient I/O handling
     if (cpu_pin_e_core() == 0) {
         ctx->e_core_pinned = 1;
+    }
+    
+    // Bind to high-priority core (avoid E-core for latency-sensitive I/O)
+    // Note: On macOS, pthread_setaffinity_np is not available, but we can set real-time priority
+    // Set real-time priority
+    struct sched_param param = {.sched_priority = 49};
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+        // Real-time scheduling may require privileges, continue if it fails
+        // Silently continue - this is expected if running without privileges
     }
     
     return 0;
@@ -131,13 +143,23 @@ int io_remove_socket(IOContext* ctx, int fd) {
     return 0;
 }
 
-int io_poll(IOContext* ctx, struct kevent* events, int max_events) {
+int io_poll(IOContext* ctx, struct kevent* events, int max_events, int timeout_us) {
     if (!ctx || !events || max_events <= 0) {
         return -1;
     }
     
-    // Non-blocking poll (timeout = 0)
-    struct timespec timeout = { 0, 0 };
+    // Configure timeout (default 10µs for HFT optimization - balances responsiveness and CPU usage)
+    struct timespec timeout;
+    if (timeout_us <= 0) {
+        // Non-blocking poll
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = 0;
+    } else {
+        // Convert microseconds to timespec
+        timeout.tv_sec = timeout_us / 1000000;
+        timeout.tv_nsec = (timeout_us % 1000000) * 1000;
+    }
+    
     int n = kevent(ctx->kq, NULL, 0, events, max_events, &timeout);
     
     // Re-enable EV_ONESHOT events
@@ -213,15 +235,22 @@ ssize_t io_read(IOContext* ctx, int socket_index) {
                     // Store NIC timestamp
                     sock->last_nic_timestamp_ns = nic_ns;
                 
-                    // Convert to CPU cycles (approximate using mach_absolute_time)
-                    uint64_t now_ticks = arm_cycle_count();
-                    uint64_t now_ns = arm_cycles_to_ns(now_ticks);
+                    // Convert to CPU cycles using integer arithmetic only (HFT optimization)
+                    uint64_t now_ticks = mach_absolute_time();
+                    // Use cached timebase (same as ssl.c)
+                    static mach_timebase_info_data_t cached_timebase_io = {0, 0};
+                    static bool timebase_initialized_io = false;
+                    if (!timebase_initialized_io) {
+                        mach_timebase_info(&cached_timebase_io);
+                        timebase_initialized_io = true;
+                    }
+                    uint64_t now_ns = (now_ticks * cached_timebase_io.numer) / cached_timebase_io.denom;
                 
-                    // Estimate NIC timestamp in ticks
-                    if (nic_ns <= now_ns) {
+                    // Estimate NIC timestamp in ticks using integer arithmetic
+                    if (nic_ns <= now_ns && now_ns > 0) {
                         uint64_t diff_ns = now_ns - nic_ns;
-                        double cycles_per_ns = (double)now_ticks / (double)now_ns;
-                        uint64_t diff_ticks = (uint64_t)((double)diff_ns * cycles_per_ns);
+                        // Integer-only conversion: convert diff_ns to cycles
+                        uint64_t diff_ticks = (diff_ns * cached_timebase_io.denom) / cached_timebase_io.numer;
                         sock->last_nic_timestamp_ticks = now_ticks > diff_ticks ? now_ticks - diff_ticks : 0;
                     } else {
                         sock->last_nic_timestamp_ticks = now_ticks;
@@ -238,15 +267,22 @@ ssize_t io_read(IOContext* ctx, int socket_index) {
                     // Store NIC timestamp
                     sock->last_nic_timestamp_ns = nic_ns;
                 
-                    // Convert to CPU cycles (approximate using mach_absolute_time)
-                    uint64_t now_ticks = arm_cycle_count();
-                    uint64_t now_ns = arm_cycles_to_ns(now_ticks);
+                    // Convert to CPU cycles using integer arithmetic only (HFT optimization)
+                    uint64_t now_ticks = mach_absolute_time();
+                    // Use cached timebase (same as ssl.c)
+                    static mach_timebase_info_data_t cached_timebase_io = {0, 0};
+                    static bool timebase_initialized_io = false;
+                    if (!timebase_initialized_io) {
+                        mach_timebase_info(&cached_timebase_io);
+                        timebase_initialized_io = true;
+                    }
+                    uint64_t now_ns = (now_ticks * cached_timebase_io.numer) / cached_timebase_io.denom;
                 
-                    // Estimate NIC timestamp in ticks
+                    // Estimate NIC timestamp in ticks using integer arithmetic
                     if (nic_ns <= now_ns && now_ns > 0) {
                         uint64_t diff_ns = now_ns - nic_ns;
-                        double cycles_per_ns = (double)now_ticks / (double)now_ns;
-                        uint64_t diff_ticks = (uint64_t)((double)diff_ns * cycles_per_ns);
+                        // Integer-only conversion: convert diff_ns to cycles
+                        uint64_t diff_ticks = (diff_ns * cached_timebase_io.denom) / cached_timebase_io.numer;
                         sock->last_nic_timestamp_ticks = now_ticks > diff_ticks ? now_ticks - diff_ticks : 0;
                     } else {
                         sock->last_nic_timestamp_ticks = now_ticks;
@@ -268,7 +304,7 @@ ssize_t io_read(IOContext* ctx, int socket_index) {
             new_wp = second_part;
         }
         
-        __sync_synchronize();
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         sock->rx_ring->write_ptr = new_wp % sock->rx_ring->size;
     } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
         return -1;  // Error or EOF
@@ -296,14 +332,29 @@ ssize_t io_write(IOContext* ctx, int socket_index) {
         return 0;  // No data to write
     }
     
-    // Write directly from ring buffer (zero-copy)
-    ssize_t n = write(sock->fd, read_ptr, available);
+    RingBuffer* rb = sock->tx_ring;
+    struct iovec iov[2] = {0};
+    int iov_cnt = 1;
+    
+    iov[0].iov_base = read_ptr;
+    iov[0].iov_len = available;
+    
+    // Handle wrap-around with scatter-gather
+    if (rb->read_ptr + available > rb->size) {
+        iov[0].iov_len = rb->size - rb->read_ptr;
+        iov[1].iov_base = rb->buf;
+        iov[1].iov_len = available - iov[0].iov_len;
+        iov_cnt = 2;
+    }
+    
+    // Zero-copy batch write
+    ssize_t n = writev(sock->fd, iov, iov_cnt);
     
     if (n > 0) {
         // Update ring buffer read pointer
-        size_t rp = sock->tx_ring->read_ptr;
-        __sync_synchronize();
-        sock->tx_ring->read_ptr = (rp + n) % sock->tx_ring->size;
+        size_t rp = rb->read_ptr;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        rb->read_ptr = (rp + n) % rb->size;
     }
     
     return n;

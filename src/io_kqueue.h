@@ -43,9 +43,10 @@ int io_add_socket(IOContext* ctx, int fd, RingBuffer* rx_ring, RingBuffer* tx_ri
 // Returns 0 on success, -1 on error
 int io_remove_socket(IOContext* ctx, int fd);
 
-// Poll for I/O events (non-blocking)
+// Poll for I/O events
+// timeout_us: timeout in microseconds (0 for non-blocking, default 10µs for HFT)
 // Returns number of events ready, -1 on error
-int io_poll(IOContext* ctx, struct kevent* events, int max_events);
+int io_poll(IOContext* ctx, struct kevent* events, int max_events, int timeout_us);
 
 // Read data from socket directly into ring buffer (zero-copy)
 // Captures NIC timestamp via SO_TIMESTAMP_OLD if available

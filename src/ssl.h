@@ -48,5 +48,9 @@ uint64_t ssl_get_last_nic_timestamp_ns(SSLContext* ctx);
 // Returns timestamp in CPU cycles, or 0 if not available
 uint64_t ssl_get_last_nic_timestamp_ticks(SSLContext* ctx);
 
+// Check if SSL handshake is complete
+// Returns true if handshake is finished, false otherwise
+bool ssl_is_handshake_complete(SSLContext* ctx);
+
 #endif // SSL_H
 

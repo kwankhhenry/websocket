@@ -18,11 +18,26 @@ set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address")
 # Additional M4-specific flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter")
 
-# Enable Neon SIMD
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a+simd")
+# Enhanced CPU-specific optimizations for Apple M4
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    # Enable Neon SIMD and crypto extensions for M4 (use simd instead of neon for newer clang)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8.2-a+simd+crypto")
+    # Tune for Apple M4 (Cortex-A76 derived)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mtune=cortex-a76")
+endif()
 
-# Group hot paths into separate section for L2 cache optimization
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -ffunction-sections -fdata-sections")
+# Link-Time Optimization (LTO) for cross-module optimizations
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -flto=thin")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto=thin")
+
+# Loop unrolling (carefully applied for hot paths)
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -funroll-loops")
+
+# Additional HFT optimizations
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -fno-trapping-math -fomit-frame-pointer")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -ffunction-sections -fdata-sections")
+# Use macOS-compatible linker flags (--gc-sections is GNU-specific, not supported on macOS)
+# Note: -z,now is Linux-specific and not applicable on macOS
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-dead_strip")
 
 # Source files
@@ -122,9 +137,35 @@ target_link_libraries(test_kqueue websocket_hft)
 add_executable(test_integration_binance tests/test_integration_binance.c)
 target_link_libraries(test_integration_binance websocket_hft)
 
+add_executable(test_websocket_reconnect tests/test_websocket_reconnect.c)
+target_link_libraries(test_websocket_reconnect websocket_hft)
+
 add_executable(benchmark tests/benchmark.c)
 target_link_libraries(benchmark websocket_hft)
 target_link_libraries(benchmark m)  # Link math library for sqrt()
+
+# Comprehensive test suite executables
+add_executable(test_memory tests/test_memory.c)
+target_link_libraries(test_memory websocket_hft)
+target_link_libraries(test_memory m)  # For sqrt() in helpers
+
+add_executable(test_stress tests/test_stress.c)
+target_link_libraries(test_stress websocket_hft)
+target_link_libraries(test_stress m)
+
+add_executable(test_errors tests/test_errors.c)
+target_link_libraries(test_errors websocket_hft)
+
+add_executable(test_performance tests/test_performance.c)
+target_link_libraries(test_performance websocket_hft)
+target_link_libraries(test_performance m)
+
+add_executable(test_threading tests/test_threading.c)
+target_link_libraries(test_threading websocket_hft)
+
+add_executable(test_integration_stress tests/test_integration_stress.c)
+target_link_libraries(test_integration_stress websocket_hft)
+target_link_libraries(test_integration_stress m)
 
 # Example executable
 add_executable(binance_ticker examples/binance_ticker.c)
@@ -140,9 +181,24 @@ install(FILES ${HEADERS}
     DESTINATION include/websocket_hft
 )
 
-# CTest support (if tests are added)
+# CTest support
 enable_testing()
 add_test(NAME test_ringbuffer COMMAND test_ringbuffer)
 add_test(NAME test_parser_neon COMMAND test_parser_neon)
 add_test(NAME test_kqueue COMMAND test_kqueue)
+add_test(NAME test_memory COMMAND test_memory)
+add_test(NAME test_errors COMMAND test_errors)
+add_test(NAME test_threading COMMAND test_threading)
+add_test(NAME test_performance COMMAND test_performance)
+
+# Note: Stress and integration tests are not included in CTest by default
+# as they may take a long time. Run them manually or via run_all_tests.sh
+
+# AddressSanitizer build configuration
+option(BUILD_WITH_ASAN "Build with AddressSanitizer" OFF)
+if(BUILD_WITH_ASAN)
+    set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -fsanitize=address -fno-omit-frame-pointer")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+    message(STATUS "Building with AddressSanitizer enabled")
+endif()
 

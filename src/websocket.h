@@ -31,6 +31,44 @@ typedef void (*ws_on_message_t)(WebSocket* ws, const uint8_t* data, size_t len, 
 // Error callback type
 typedef void (*ws_on_error_t)(WebSocket* ws, int error_code, const char* error_msg, void* user_data);
 
+// PHASE 2: Observability - Metrics structure
+typedef struct {
+    uint64_t messages_received;
+    uint64_t messages_sent;
+    uint64_t errors_total;
+    uint64_t bytes_received;
+    uint64_t bytes_sent;
+    double latency_p50_ns;
+    double latency_p99_ns;
+    double throughput_msg_per_sec;
+    double ringbuffer_utilization;
+    uint64_t connection_uptime_ns;
+} WebSocketMetrics;
+
+// PHASE 2: Observability - Metrics callback type
+typedef void (*ws_on_metrics_t)(WebSocket* ws, const WebSocketMetrics* metrics, void* user_data);
+
+// PHASE 2: Observability - Health status
+typedef enum {
+    WS_HEALTH_OK,
+    WS_HEALTH_DEGRADED,  // High latency, buffer saturation
+    WS_HEALTH_UNHEALTHY  // Connection issues, errors
+} WSHealthStatus;
+
+// PHASE 2: Observability - Health check callback type
+typedef void (*ws_on_health_t)(WebSocket* ws, WSHealthStatus status, const char* reason, void* user_data);
+
+// PHASE 2: Observability - Logging
+typedef enum {
+    WS_LOG_DEBUG,
+    WS_LOG_INFO,
+    WS_LOG_WARN,
+    WS_LOG_ERROR
+} WSLogLevel;
+
+// PHASE 2: Observability - Log callback type
+typedef void (*ws_log_callback_t)(WebSocket* ws, WSLogLevel level, const char* message, void* user_data);
+
 // Create WebSocket instance
 // Returns NULL on error
 WebSocket* websocket_create(void);
@@ -75,6 +113,51 @@ uint64_t websocket_get_last_nic_timestamp_ns(WebSocket* ws);
 
 // Get last NIC timestamp in CPU cycles
 uint64_t websocket_get_last_nic_timestamp_ticks(WebSocket* ws);
+
+// PHASE 2: Observability - Metrics API
+void websocket_set_on_metrics(WebSocket* ws, ws_on_metrics_t callback, void* user_data);
+void websocket_get_metrics(WebSocket* ws, WebSocketMetrics* out_metrics);
+void websocket_reset_metrics(WebSocket* ws);
+
+// PHASE 2: Observability - Health check API
+WSHealthStatus websocket_get_health(WebSocket* ws);
+void websocket_set_on_health(WebSocket* ws, ws_on_health_t callback, void* user_data);
+
+// PHASE 2: Observability - Logging API
+void websocket_set_log_callback(WebSocket* ws, ws_log_callback_t callback, void* user_data);
+
+// PHASE 3: Error Recovery - Reconnection configuration
+typedef struct {
+    bool auto_reconnect;
+    uint32_t max_retries;           // 0 = unlimited
+    uint32_t initial_backoff_ms;    // e.g., 100ms
+    uint32_t max_backoff_ms;        // e.g., 30000ms (30s)
+    double backoff_multiplier;      // e.g., 2.0
+    bool reset_backoff_on_success;
+} WSReconnectConfig;
+
+// PHASE 3: Error Recovery - Reconnection state
+typedef struct {
+    uint32_t reconnect_attempts;
+    uint32_t next_backoff_ms;
+    bool is_reconnecting;
+} WSReconnectState;
+
+// PHASE 3: Error Recovery - Heartbeat configuration
+typedef struct {
+    bool enable_heartbeat;
+    uint32_t ping_interval_ms;      // Send ping every N ms
+    uint32_t pong_timeout_ms;       // Expect pong within N ms
+    void (*on_heartbeat_timeout)(WebSocket* ws, void* user_data);
+    void* heartbeat_user_data;
+} WSHeartbeatConfig;
+
+// PHASE 3: Error Recovery - Reconnection API
+void websocket_set_reconnect_config(WebSocket* ws, const WSReconnectConfig* config);
+void websocket_get_reconnect_state(WebSocket* ws, WSReconnectState* out_state);
+
+// PHASE 3: Error Recovery - Heartbeat API
+void websocket_set_heartbeat_config(WebSocket* ws, const WSHeartbeatConfig* config);
 
 #endif // WEBSOCKET_H
 

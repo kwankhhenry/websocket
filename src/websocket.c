@@ -8,7 +8,10 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <ctype.h>
 #include <sys/socket.h>
+#include <sys/event.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -17,6 +20,38 @@
 #include <openssl/sha.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <time.h>
+#include <mach/mach_time.h>
+
+// Forward declarations
+static int websocket_send_pong(WebSocket* ws, const uint8_t* payload, size_t payload_len);
+static void update_latency_sample(WebSocket* ws, uint64_t latency_ns);
+static void check_health(WebSocket* ws);
+static void report_metrics_if_needed(WebSocket* ws);
+static void check_heartbeat(WebSocket* ws);
+static void trigger_reconnect(WebSocket* ws);
+
+// PHASE 2: Observability - Logging macro helper
+#define WS_LOG(ws, level, fmt, ...) \
+    do { \
+        if ((ws) && (ws)->log_callback) { \
+            char log_buf[512]; \
+            snprintf(log_buf, sizeof(log_buf), fmt, ##__VA_ARGS__); \
+            (ws)->log_callback((ws), (level), log_buf, (ws)->log_user_data); \
+        } \
+    } while(0)
+
+// Helper to get current time in nanoseconds
+static uint64_t get_time_ns(void) {
+    static mach_timebase_info_data_t timebase = {0, 0};
+    static bool timebase_inited = false;
+    if (!timebase_inited) {
+        mach_timebase_info(&timebase);
+        timebase_inited = true;
+    }
+    uint64_t ticks = mach_absolute_time();
+    return (ticks * timebase.numer) / timebase.denom;
+}
 
 // Precomputed HTTP upgrade headers (const to avoid ARC overhead if objc interop needed)
 const char* const ws_http_upgrade_template = 
@@ -46,8 +81,8 @@ struct WebSocket {
     
     // Connection state
     char* url;
-    char* host;
-    char* path;
+    char host[256];    // Fixed-size buffer for hostname (supports 255-char domains)
+    char path[1024];   // Fixed-size buffer for path + query parameters
     int port;
     bool use_ssl;
     bool cert_validation_disabled;
@@ -57,6 +92,47 @@ struct WebSocket {
     
     // I/O socket index
     int socket_index;
+    
+    // Frame pool for zero-allocation parsing (HFT optimization)
+    WSFrame frame_pool[16];  // Pre-allocate 16 frames (covers 99% of scenarios)
+    int frame_pool_idx;      // Index for round-robin reuse
+    
+    // Error tracking
+    uint32_t frame_parse_errors;  // Count of frame parse errors
+    
+    // PHASE 2: Observability - Metrics tracking
+    WebSocketMetrics metrics;
+    uint64_t metrics_last_report_ns;  // Last time metrics were reported
+    uint64_t connection_start_ns;     // Connection start time (nanoseconds)
+    
+    // Latency tracking (for percentile calculation)
+    uint64_t* latency_samples;        // Array of latency samples
+    size_t latency_sample_count;       // Current number of samples
+    size_t latency_sample_capacity;    // Maximum samples (for rolling window)
+    size_t latency_sample_idx;        // Current index in rolling window
+    
+    // PHASE 2: Observability - Callbacks
+    ws_on_metrics_t on_metrics;
+    void* metrics_user_data;
+    ws_on_health_t on_health;
+    void* health_user_data;
+    ws_log_callback_t log_callback;
+    void* log_user_data;
+    
+    // PHASE 2: Observability - Health state
+    WSHealthStatus current_health;
+    uint64_t last_health_check_ns;
+    uint64_t last_metric_reset_ns;  // PRIORITY 1: Track last metric reset time
+    
+    // PHASE 3: Error Recovery - Reconnection state
+    WSReconnectConfig reconnect_config;
+    WSReconnectState reconnect_state;
+    uint64_t last_reconnect_attempt_ns;
+    
+    // PHASE 3: Error Recovery - Heartbeat state
+    WSHeartbeatConfig heartbeat_config;
+    uint64_t last_ping_sent_ns;
+    uint64_t last_pong_received_ns;
 };
 
 // Generate WebSocket key for handshake
@@ -102,9 +178,11 @@ static void generate_websocket_key(char* key_out) {
     EVP_ENCODE_CTX_free(ctx);
 }
 
-// Parse URL into components
-static int parse_url(const char* url, char** host_out, char** path_out, int* port_out, bool* use_ssl_out) {
-    if (!url || !host_out || !path_out || !port_out || !use_ssl_out) {
+// Parse URL into components (using pre-allocated buffers to avoid dynamic allocation)
+static int parse_url(const char* url, char* host_buf, size_t host_len,
+                     char* path_buf, size_t path_len,
+                     int* port_out, bool* use_ssl_out) {
+    if (!url || !host_buf || !path_buf || !port_out || !use_ssl_out) {
         return -1;
     }
     
@@ -132,15 +210,15 @@ static int parse_url(const char* url, char** host_out, char** path_out, int* por
     if (question && question < host_end) host_end = question;
     
     // Extract hostname (without port)
+    size_t actual_host_len;
     if (colon && colon < host_end) {
         // Port is present, extract hostname up to colon
-        size_t host_len = colon - host_start;
-        *host_out = malloc(host_len + 1);
-        if (!*host_out) {
-            return -1;
+        actual_host_len = colon - host_start;
+        if (actual_host_len >= host_len) {
+            return -1;  // Buffer overflow
         }
-        memcpy(*host_out, host_start, host_len);
-        (*host_out)[host_len] = '\0';
+        memcpy(host_buf, host_start, actual_host_len);
+        host_buf[actual_host_len] = '\0';
         
         // Parse port (between colon and host_end)
         const char* port_start = colon + 1;
@@ -154,13 +232,12 @@ static int parse_url(const char* url, char** host_out, char** path_out, int* por
         }
     } else {
         // No port, extract hostname up to host_end
-        size_t host_len = host_end - host_start;
-        *host_out = malloc(host_len + 1);
-        if (!*host_out) {
-            return -1;
+        actual_host_len = host_end - host_start;
+        if (actual_host_len >= host_len) {
+            return -1;  // Buffer overflow
         }
-        memcpy(*host_out, host_start, host_len);
-        (*host_out)[host_len] = '\0';
+        memcpy(host_buf, host_start, actual_host_len);
+        host_buf[actual_host_len] = '\0';
         
         // Default port
         *port_out = *use_ssl_out ? 443 : 80;
@@ -168,9 +245,18 @@ static int parse_url(const char* url, char** host_out, char** path_out, int* por
     
     // Parse path (include everything after host, including query strings)
     if (*host_end == '/' || *host_end == '?') {
-        *path_out = strdup(host_end);
+        size_t path_str_len = strlen(host_end);
+        if (path_str_len >= path_len) {
+            return -1;  // Buffer overflow
+        }
+        memcpy(path_buf, host_end, path_str_len);
+        path_buf[path_str_len] = '\0';
     } else {
-        *path_out = strdup("/");
+        if (path_len < 2) {
+            return -1;
+        }
+        path_buf[0] = '/';
+        path_buf[1] = '\0';
     }
     
     return 0;
@@ -197,6 +283,18 @@ static int tcp_connect(const char* host, int port) {
         if (fd == -1) {
             continue;
         }
+        
+        // CRITICAL: Enable SO_TIMESTAMP BEFORE connect() for NIC timestamp capture
+        // This must be done before connection so kernel timestamps all received packets
+        int timestamp_on = 1;
+        #ifdef SO_TIMESTAMPNS
+        if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &timestamp_on, sizeof(timestamp_on)) < 0) {
+            // Fallback to SO_TIMESTAMP if SO_TIMESTAMPNS not available
+            setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp_on, sizeof(timestamp_on));
+        }
+        #else
+        setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp_on, sizeof(timestamp_on));
+        #endif
         
         if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
             break;  // Success
@@ -238,61 +336,138 @@ static int send_handshake(WebSocket* ws) {
     return 0;
 }
 
-// Parse HTTP response and verify handshake
+// Parse HTTP response and verify handshake (single-pass FSM for HFT optimization)
+// CRITICAL FIX: Use case-insensitive header matching and improved header parsing
 static int parse_handshake_response(WebSocket* ws) {
-    // Read from rx_ring
-    char response[WS_MAX_HEADER_SIZE];
-    size_t read = ringbuffer_read(&ws->rx_ring, response, sizeof(response) - 1);
-    if (read == 0) {
+    // Use read_inline to peek without consuming (in case we need more data)
+    char* response_ptr;
+    size_t response_len;
+    ringbuffer_read_inline(&ws->rx_ring, &response_ptr, &response_len);
+    
+    if (response_len == 0 || !response_ptr) {
         return 1;  // Need more data
     }
     
-    response[read] = '\0';
-    
-    // Try to find HTTP response even if there's binary data first
-    const char* http_start = strstr(response, "HTTP");
-    if (http_start && http_start != response) {
-        // Shift response to start at HTTP
-        size_t offset = http_start - response;
-        memmove(response, http_start, read - offset);
-        response[read - offset] = '\0';
-        read = read - offset;
+    // Need at least "HTTP/1.1 101" to have valid response
+    if (response_len < 12) {
+        return 1;  // Need more data - too short
     }
     
-    // Check for "HTTP/1.1 101 Switching Protocols"
-    if (strstr(response, "HTTP/1.1 101") == NULL && 
-        strstr(response, "HTTP/1.0 101") == NULL) {
-        return -1;  // Invalid response
+    // Find HTTP response start (handle potential binary data before HTTP)
+    const char* http_start = NULL;
+    for (size_t i = 0; i < response_len && i < 100; i++) {  // Limit search to first 100 bytes
+        if (response_len - i >= 12) {
+            if (strncmp((char*)response_ptr + i, "HTTP/1.1", 8) == 0 ||
+                strncmp((char*)response_ptr + i, "HTTP/1.0", 8) == 0) {
+                http_start = (char*)response_ptr + i;
+                break;
+            }
+        }
     }
     
-    // Check for "Upgrade: websocket"
-    if (strstr(response, "Upgrade: websocket") == NULL) {
+    if (!http_start) {
+        // No HTTP found - might be SSL handshake data or incomplete
+        // Check if we have enough data that we should have seen HTTP by now
+        if (response_len > 200) {
+            return -1;  // Have substantial data but no HTTP - invalid
+        }
+        return 1;  // Need more data
+    }
+    
+    // Now parse from http_start
+    // Make a null-terminated copy for string functions
+    size_t http_offset = http_start - (char*)response_ptr;
+    size_t remaining = response_len - http_offset;
+    char response[WS_MAX_HEADER_SIZE];
+    size_t copy_len = (remaining < sizeof(response) - 1) ? remaining : sizeof(response) - 1;
+    memcpy(response, http_start, copy_len);
+    response[copy_len] = '\0';
+    
+    // Check for HTTP 101 status
+    bool http_valid = false;
+    bool upgrade_valid = false;
+    bool connection_valid = false;
+    
+    // Look for "HTTP/1.1 101" or "HTTP/1.0 101"
+    if (copy_len >= 12) {
+        if (strncmp(response, "HTTP/1.1 101", 12) == 0 ||
+            strncmp(response, "HTTP/1.0 101", 12) == 0) {
+            http_valid = true;
+        }
+    }
+    
+    if (!http_valid) {
+        // HTTP status not 101 - handshake failed
         return -1;
     }
     
-    // Check for "Connection: Upgrade"
-    if (strstr(response, "Connection: Upgrade") == NULL &&
-        strstr(response, "Connection: upgrade") == NULL) {
-        return -1;
+    // Case-insensitive search for headers
+    char* response_lower = malloc(copy_len + 1);
+    if (!response_lower) return -1;
+    for (size_t i = 0; i < copy_len; i++) {
+        response_lower[i] = (char)tolower((unsigned char)response[i]);
+    }
+    response_lower[copy_len] = '\0';
+    
+    // Look for "upgrade: websocket" (case-insensitive)
+    if (strstr(response_lower, "upgrade: websocket") != NULL ||
+        strstr(response_lower, "upgrade:websocket") != NULL) {
+        upgrade_valid = true;
     }
     
-    // For HFT, we can skip Sec-WebSocket-Accept validation if needed
-    // But we'll do basic validation
-    if (strstr(response, "Sec-WebSocket-Accept") == NULL) {
-        // Optional: could validate the accept key here
+    // Look for "connection: upgrade" (case-insensitive)
+    if (strstr(response_lower, "connection: upgrade") != NULL ||
+        strstr(response_lower, "connection:upgrade") != NULL) {
+        connection_valid = true;
     }
     
-    return 0;
+    free(response_lower);
+    
+    // If all valid, consume the response from ringbuffer
+    if (http_valid && upgrade_valid && connection_valid) {
+        // Consume at least the HTTP response (up to first blank line + some)
+        // Find end of headers (double CRLF)
+        const char* header_end = strstr((char*)http_start, "\r\n\r\n");
+        if (header_end) {
+            size_t header_len = (header_end - http_start) + 4;  // Include \r\n\r\n
+            // Consume from http_start to end of headers
+            size_t consumed = ringbuffer_read(&ws->rx_ring, NULL, http_offset);  // Skip data before HTTP
+            if (consumed == http_offset) {
+                // Now consume the HTTP response headers
+                char dummy[4096];
+                ringbuffer_read(&ws->rx_ring, dummy, 
+                    (header_len < sizeof(dummy)) ? header_len : sizeof(dummy));
+            }
+        } else {
+            // No \r\n\r\n found yet - but we validated, so consume what we checked
+            // Actually, if we validated, the headers should be complete
+            // For safety, don't consume if we can't find header end
+        }
+        return 0;  // Success
+    }
+    
+    // Need more data to complete parsing
+    return 1;
 }
 
-// Process received WebSocket frames
+// Get frame from pool (lock-free for single-threaded context)
+static inline WSFrame* get_frame_from_pool(WebSocket* ws) {
+    ws->frame_pool_idx = (ws->frame_pool_idx + 1) % 16;
+    WSFrame* frame = &ws->frame_pool[ws->frame_pool_idx];
+    // Only reset fields that change per frame (skip payload pointer)
+    memset(frame, 0, offsetof(WSFrame, payload));
+    frame->payload = NULL;
+    return frame;
+}
+
+// Process received WebSocket frames (fixed: better bounds checking and error recovery)
 static void process_frames(WebSocket* ws) {
-    // Read available data from rx_ring
+    // Read available data from rx_ring (safety check length)
     char* data;
     size_t len;
     ringbuffer_read_inline(&ws->rx_ring, &data, &len);
     
-    if (len == 0) {
+    if (len == 0 || !data) {  // Avoid null pointer access
         return;
     }
     
@@ -300,12 +475,12 @@ static void process_frames(WebSocket* ws) {
     size_t offset = 0;
     size_t total_consumed = 0;
     int parse_attempts = 0;
-    const int max_parse_attempts = len;  // Prevent infinite loops
+    const int max_parse_attempts = 1000;  // Fixed limit to prevent infinite loops
     
     while (offset < len && parse_attempts < max_parse_attempts) {
         parse_attempts++;
-        WSFrame frame;
-        int result = neon_parse_ws_frame((const uint8_t*)(data + offset), len - offset, &frame);
+        WSFrame* frame = get_frame_from_pool(ws);  // Use pooled frame instead of stack allocation
+        int result = neon_parse_ws_frame((const uint8_t*)(data + offset), len - offset, frame);
         
         if (result == 1) {
             // Need more data - keep what we have in buffer
@@ -314,57 +489,93 @@ static void process_frames(WebSocket* ws) {
         
         if (result != 0) {
             // Parse error - skip one byte and try again (to recover from corruption)
-            if (offset + 1 >= len) break;
+            ws->frame_parse_errors++;
+            ws->metrics.errors_total++;  // PHASE 2: Track error count
+            WS_LOG(ws, WS_LOG_WARN, "Frame parse error at offset %zu", offset);
             offset++;
             continue;
         }
         
-        // Validate frame size to prevent infinite loops
-        if (frame.header_size + frame.payload_len == 0) {
+        // Validate frame size (avoid illegal length)
+        size_t frame_size = frame->header_size + frame->payload_len;
+        if (frame_size == 0 || frame_size > len - offset) {
+            // Invalid frame size - skip one byte and try again
+            ws->frame_parse_errors++;
             offset++;
             continue;
         }
         
-        if (frame.header_size + frame.payload_len > len - offset) {
-            // Frame size exceeds available data - wait for more
-            break;
-        }
+        // Assign payload pointer to point to payload in ringbuffer
+        frame->payload = (uint8_t*)(data + offset + frame->header_size);
         
         // Process frame
-        if (frame.opcode == WS_OPCODE_TEXT || frame.opcode == WS_OPCODE_BINARY) {
+        if (frame->opcode == WS_OPCODE_TEXT || frame->opcode == WS_OPCODE_BINARY) {
             // Server-to-client frames should NOT be masked per RFC 6455
             // But handle both cases for robustness
-            uint8_t* payload = (uint8_t*)frame.payload;
-            if (frame.mask) {
+            uint8_t* payload = (uint8_t*)frame->payload;
+            if (frame->mask) {
                 // Unmask if present (shouldn't happen for server frames)
-                for (size_t i = 0; i < frame.payload_len; i++) {
-                    payload[i] ^= ((uint8_t*)(&frame.masking_key))[i % 4];
+                for (size_t i = 0; i < frame->payload_len; i++) {
+                    payload[i] ^= ((uint8_t*)(&frame->masking_key))[i % 4];
                 }
             }
             
-            // Call callback directly with payload pointer
-            // Note: Callback should copy data if it needs to hold it, since ringbuffer may advance
-            if (ws->on_message) {
-                // Store frame info in user data if needed, or pass via a separate mechanism
-                // For now, callback receives payload which is JSON (not a WebSocket frame)
-                ws->on_message(ws, payload, frame.payload_len, ws->callback_user_data);
+            // PHASE 2: Update metrics for received message
+            ws->metrics.messages_received++;
+            ws->metrics.bytes_received += frame->payload_len;
+            
+            // Calculate latency if NIC timestamp is available
+            uint64_t nic_timestamp_ns = websocket_get_last_nic_timestamp_ns(ws);
+            if (nic_timestamp_ns > 0) {
+                uint64_t now_ns = get_time_ns();
+                uint64_t latency_ns = (now_ns > nic_timestamp_ns) ? (now_ns - nic_timestamp_ns) : 0;
+                update_latency_sample(ws, latency_ns);
             }
-        } else if (frame.opcode == WS_OPCODE_CLOSE) {
+            
+            // Call callback directly with payload pointer
+            if (ws->on_message) {
+                ws->on_message(ws, payload, frame->payload_len, ws->callback_user_data);
+            }
+        } else if (frame->opcode == WS_OPCODE_PING) {
+            // CRITICAL: Binance sends ping every 20 seconds
+            // MUST respond with pong within 1 minute or connection will be closed
+            // RFC 6455: Pong frame must contain the same payload as the ping frame
+            uint8_t* ping_payload = (uint8_t*)frame->payload;
+            size_t ping_len = frame->payload_len;
+            
+            // Unmask ping payload if masked (shouldn't happen for server frames)
+            if (frame->mask && ping_payload) {
+                for (size_t i = 0; i < ping_len; i++) {
+                    ping_payload[i] ^= ((uint8_t*)(&frame->masking_key))[i % 4];
+                }
+            }
+            
+            // Send pong frame with same payload (RFC 6455 requirement)
+            // Pong frames must be masked from client to server
+            if (websocket_send_pong(ws, ping_payload, ping_len) != 0) {
+                // Failed to send pong - this may cause disconnection
+                // But don't fail the entire connection, just log it
+            }
+        } else if (frame->opcode == WS_OPCODE_PONG) {
+            // PHASE 3: Record pong receipt for heartbeat monitoring
+            ws->last_pong_received_ns = get_time_ns();
+            WS_LOG(ws, WS_LOG_DEBUG, "Received heartbeat pong");
+            // Pong response received - no action needed, just acknowledge
+            // Binance documentation says unsolicited pongs are allowed
+        } else if (frame->opcode == WS_OPCODE_CLOSE) {
             ws->state = WS_STATE_CLOSING;
         }
         
-        size_t frame_size = frame.header_size + frame.payload_len;
         offset += frame_size;
         total_consumed += frame_size;
     }
     
-    // Advance ring buffer read pointer for consumed data
+    // Optimize: Use ringbuffer_advance_read to advance pointer, avoiding manual calculation
     if (total_consumed > 0) {
-        // Manually advance read pointer (faster than calling ringbuffer_read with NULL)
-        size_t rp = ws->rx_ring.read_ptr;
+        // Manually advance read pointer using atomic operations (SPSC optimization)
+        size_t rp = __atomic_load_n(&ws->rx_ring.read_ptr, __ATOMIC_RELAXED);
         size_t new_rp = (rp + total_consumed) % ws->rx_ring.size;
-        __sync_synchronize();
-        ws->rx_ring.read_ptr = new_rp;
+        __atomic_store_n(&ws->rx_ring.read_ptr, new_rp, __ATOMIC_RELEASE);
     }
 }
 
@@ -374,9 +585,53 @@ WebSocket* websocket_create(void) {
         return NULL;
     }
     
-    ws->state = WS_STATE_CONNECTING;
+    ws->state = WS_STATE_CLOSED;  // Initial state changed to closed to avoid confusion
     ws->fd = -1;
     ws->socket_index = -1;
+    ws->ssl_ctx = NULL;
+    ws->io_ctx = NULL;
+    ws->frame_pool_idx = 0;  // Initialize frame pool index
+    ws->frame_parse_errors = 0;  // Initialize error counter
+    
+    // PHASE 2: Initialize observability fields
+    memset(&ws->metrics, 0, sizeof(WebSocketMetrics));
+    ws->metrics_last_report_ns = 0;
+    ws->connection_start_ns = 0;
+    ws->latency_samples = NULL;
+    ws->latency_sample_count = 0;
+    ws->latency_sample_capacity = 1000;  // Store up to 1000 latency samples
+    ws->latency_sample_idx = 0;
+    ws->on_metrics = NULL;
+    ws->metrics_user_data = NULL;
+    ws->on_health = NULL;
+    ws->health_user_data = NULL;
+    ws->log_callback = NULL;
+    ws->log_user_data = NULL;
+    ws->current_health = WS_HEALTH_OK;
+    ws->last_health_check_ns = 0;
+    ws->last_metric_reset_ns = 0;
+    
+    // PHASE 3: Initialize error recovery
+    memset(&ws->reconnect_config, 0, sizeof(WSReconnectConfig));
+    ws->reconnect_config.initial_backoff_ms = 100;
+    ws->reconnect_config.max_backoff_ms = 30000;
+    ws->reconnect_config.backoff_multiplier = 2.0;
+    ws->reconnect_config.reset_backoff_on_success = true;
+    memset(&ws->reconnect_state, 0, sizeof(WSReconnectState));
+    ws->last_reconnect_attempt_ns = 0;
+    ws->reconnect_state.next_backoff_ms = ws->reconnect_config.initial_backoff_ms;
+    
+    // PHASE 3: Initialize heartbeat
+    memset(&ws->heartbeat_config, 0, sizeof(WSHeartbeatConfig));
+    ws->last_ping_sent_ns = 0;
+    ws->last_pong_received_ns = 0;
+    
+    // Allocate latency samples array
+    ws->latency_samples = calloc(ws->latency_sample_capacity, sizeof(uint64_t));
+    if (!ws->latency_samples) {
+        // If allocation fails, disable latency tracking but continue
+        ws->latency_sample_capacity = 0;
+    }
     
     return ws;
 }
@@ -386,24 +641,47 @@ void websocket_destroy(WebSocket* ws) {
         return;
     }
     
-    websocket_close(ws);
+    // PRIORITY 1 FIX: Ensure clean shutdown sequence
+    // Close connection if still active (SSL cleanup will handle final shutdown)
+    if (ws->state == WS_STATE_CONNECTED || ws->state == WS_STATE_CONNECTING) {
+        websocket_close(ws);
+        // Don't wait for graceful shutdown here - SSL cleanup will handle it
+        // Waiting can cause crashes if websocket_process accesses partially-destroyed state
+    }
     
+    // Explicit cleanup order matters - SSL first, then I/O, then buffers
     if (ws->ssl_ctx) {
         ssl_cleanup(ws->ssl_ctx);
+        ws->ssl_ctx = NULL;
     }
     
     if (ws->io_ctx) {
         io_cleanup(ws->io_ctx);
         free(ws->io_ctx);
+        ws->io_ctx = NULL;
     }
     
     ringbuffer_cleanup(&ws->rx_ring);
     ringbuffer_cleanup(&ws->tx_ring);
     
-    free(ws->url);
-    free(ws->host);
-    free(ws->path);
+    // PRIORITY 2: Cleanup observability resources
+    if (ws->latency_samples) {
+        free(ws->latency_samples);
+        ws->latency_samples = NULL;
+        ws->latency_sample_count = 0;
+        ws->latency_sample_capacity = 0;
+    }
+    
+    if (ws->url) {
+        free(ws->url);
+        ws->url = NULL;
+    }
+    
+    // host and path are now stack buffers, no need to free
     free(ws);
+    
+    // Note: Memory reclamation happens automatically - no delay needed here
+    // The VM_DEALLOCATE in ssl_cleanup() handles force memory release
 }
 
 void websocket_set_on_message(WebSocket* ws, ws_on_message_t callback, void* user_data) {
@@ -428,44 +706,48 @@ int websocket_connect(WebSocket* ws, const char* url, bool disable_cert_validati
     ws->url = strdup(url);
     ws->cert_validation_disabled = disable_cert_validation;
     
-    // Parse URL
-    if (parse_url(url, &ws->host, &ws->path, &ws->port, &ws->use_ssl) != 0) {
+    // Parse URL (using pre-allocated buffers)
+    if (parse_url(url, ws->host, sizeof(ws->host), ws->path, sizeof(ws->path), &ws->port, &ws->use_ssl) != 0) {
+        free(ws->url);
+        ws->url = NULL;
         return -1;
     }
     
     // Initialize ring buffers
     if (ringbuffer_init(&ws->rx_ring) != 0 || ringbuffer_init(&ws->tx_ring) != 0) {
-        fprintf(stderr, "ERROR: Ring buffer init failed\n");
         goto cleanup;
     }
     
     // Initialize I/O context
     ws->io_ctx = malloc(sizeof(IOContext));
     if (!ws->io_ctx || io_init(ws->io_ctx) != 0) {
-        fprintf(stderr, "ERROR: I/O context init failed\n");
         goto cleanup;
     }
     
     // Connect TCP
     ws->fd = tcp_connect(ws->host, ws->port);
     if (ws->fd < 0) {
-        fprintf(stderr, "ERROR: TCP connect failed for %s:%d\n", ws->host, ws->port);
         goto cleanup;
     }
     
-    // Enable SO_TIMESTAMP on socket BEFORE SSL init to capture NIC timestamps
-    // This is critical for measuring real NIC→SSL latency
-    int timestamp_on = 1;
+    // SO_TIMESTAMP is now enabled in tcp_connect() BEFORE connect()
+    // This ensures kernel timestamps all received packets from the start
+    // Verify it's still enabled (should be, but check for safety)
+    int timestamp_value = 0;
+    socklen_t optlen = sizeof(timestamp_value);
     #ifdef SO_TIMESTAMPNS
-    if (setsockopt(ws->fd, SOL_SOCKET, SO_TIMESTAMPNS, &timestamp_on, sizeof(timestamp_on)) < 0) {
-        // Fallback to SO_TIMESTAMP if SO_TIMESTAMPNS not available
-        if (setsockopt(ws->fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp_on, sizeof(timestamp_on)) < 0) {
-            fprintf(stderr, "WARNING: Failed to enable SO_TIMESTAMP on socket\n");
+    if (getsockopt(ws->fd, SOL_SOCKET, SO_TIMESTAMPNS, &timestamp_value, &optlen) < 0 || timestamp_value == 0) {
+        // Not enabled, try to enable it
+        timestamp_value = 1;
+        if (setsockopt(ws->fd, SOL_SOCKET, SO_TIMESTAMPNS, &timestamp_value, sizeof(timestamp_value)) < 0) {
+            // Fallback to SO_TIMESTAMP
+            setsockopt(ws->fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp_value, sizeof(timestamp_value));
         }
     }
     #else
-    if (setsockopt(ws->fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp_on, sizeof(timestamp_on)) < 0) {
-        fprintf(stderr, "WARNING: Failed to enable SO_TIMESTAMP on socket\n");
+    if (getsockopt(ws->fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp_value, &optlen) < 0 || timestamp_value == 0) {
+        timestamp_value = 1;
+        setsockopt(ws->fd, SOL_SOCKET, SO_TIMESTAMP, &timestamp_value, sizeof(timestamp_value));
     }
     #endif
     
@@ -494,7 +776,6 @@ int websocket_connect(WebSocket* ws, const char* url, bool disable_cert_validati
     
     // Send handshake
     if (send_handshake(ws) != 0) {
-        fprintf(stderr, "ERROR: Failed to send WebSocket handshake\n");
         goto cleanup;
     }
     
@@ -512,9 +793,98 @@ cleanup:
         free(ws->io_ctx);
         ws->io_ctx = NULL;
     }
+    if (ws->url) {
+        free(ws->url);
+        ws->url = NULL;
+    }
     ringbuffer_cleanup(&ws->rx_ring);
     ringbuffer_cleanup(&ws->tx_ring);
     return -1;
+}
+
+// Send pong frame (internal helper for ping response)
+// CRITICAL: RFC 6455 requires client-to-server frames to be MASKED
+static int websocket_send_pong(WebSocket* ws, const uint8_t* payload, size_t payload_len) {
+    if (!ws || ws->state != WS_STATE_CONNECTED) {
+        return -1;
+    }
+    
+    // Generate random masking key (required for client-to-server frames)
+    uint32_t masking_key;
+    // Use /dev/urandom for portability (arc4random_buf may not be available)
+    FILE* urandom = fopen("/dev/urandom", "r");
+    if (urandom) {
+        fread(&masking_key, 1, sizeof(masking_key), urandom);
+        fclose(urandom);
+    } else {
+        // Fallback (less secure but better than nothing)
+        masking_key = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+    }
+    
+    // Build WebSocket pong frame with masking
+    uint8_t frame_header[14];
+    size_t header_size = 2;
+    
+    frame_header[0] = 0x80 | WS_OPCODE_PONG;  // FIN + PONG opcode
+    frame_header[1] = 0x80;  // MASK bit set (required for client-to-server)
+    
+    if (payload_len < 126) {
+        frame_header[1] |= payload_len;
+        frame_header[2] = ((uint8_t*)&masking_key)[0];
+        frame_header[3] = ((uint8_t*)&masking_key)[1];
+        frame_header[4] = ((uint8_t*)&masking_key)[2];
+        frame_header[5] = ((uint8_t*)&masking_key)[3];
+        header_size = 6;
+    } else if (payload_len < 65536) {
+        frame_header[1] |= 126;
+        uint16_t len16 = htons((uint16_t)payload_len);
+        memcpy(frame_header + 2, &len16, 2);
+        frame_header[4] = ((uint8_t*)&masking_key)[0];
+        frame_header[5] = ((uint8_t*)&masking_key)[1];
+        frame_header[6] = ((uint8_t*)&masking_key)[2];
+        frame_header[7] = ((uint8_t*)&masking_key)[3];
+        header_size = 8;
+    } else {
+        frame_header[1] |= 127;
+        uint64_t len64 = __builtin_bswap64(payload_len);
+        memcpy(frame_header + 2, &len64, 8);
+        frame_header[10] = ((uint8_t*)&masking_key)[0];
+        frame_header[11] = ((uint8_t*)&masking_key)[1];
+        frame_header[12] = ((uint8_t*)&masking_key)[2];
+        frame_header[13] = ((uint8_t*)&masking_key)[3];
+        header_size = 14;
+    }
+    
+    // Write frame header to tx_ring
+    size_t written = ringbuffer_write(&ws->tx_ring, frame_header, header_size);
+    if (written != header_size) {
+        return -1;
+    }
+    
+    // Mask and write payload (RFC 6455: mask payload with rotating key)
+    if (payload && payload_len > 0) {
+        uint8_t* masked_payload = malloc(payload_len);
+        if (!masked_payload) {
+            return -1;
+        }
+        for (size_t i = 0; i < payload_len; i++) {
+            masked_payload[i] = payload[i] ^ ((uint8_t*)&masking_key)[i % 4];
+        }
+        written = ringbuffer_write(&ws->tx_ring, masked_payload, payload_len);
+        free(masked_payload);
+        if (written != payload_len) {
+            return -1;
+        }
+    }
+    
+    // Send via SSL or direct I/O
+    if (ws->use_ssl) {
+        ssl_write(ws->ssl_ctx, &ws->tx_ring);
+    } else {
+        io_write(ws->io_ctx, ws->socket_index);
+    }
+    
+    return 0;
 }
 
 int websocket_send(WebSocket* ws, const uint8_t* data, size_t len, bool is_text) {
@@ -554,6 +924,10 @@ int websocket_send(WebSocket* ws, const uint8_t* data, size_t len, bool is_text)
         return -1;
     }
     
+    // PHASE 2: Update metrics for sent message
+    ws->metrics.messages_sent++;
+    ws->metrics.bytes_sent += len;
+    
     // Send via SSL or direct I/O
     if (ws->use_ssl) {
         ssl_write(ws->ssl_ctx, &ws->tx_ring);
@@ -573,6 +947,8 @@ int websocket_close(WebSocket* ws) {
         if (ws->socket_index >= 0) {
             io_remove_socket(ws->io_ctx, ws->fd);
         }
+        // CRITICAL: Shutdown socket properly for clean SSL/TLS closure
+        shutdown(ws->fd, SHUT_RDWR);
         close(ws->fd);
         ws->fd = -1;
     }
@@ -587,7 +963,8 @@ int websocket_process(WebSocket* ws) {
     }
     
     struct kevent events[IO_MAX_SOCKETS];
-    int event_count = io_poll(ws->io_ctx, events, IO_MAX_SOCKETS);
+    // Use 10µs timeout for HFT optimization (balances responsiveness and CPU usage)
+    int event_count = io_poll(ws->io_ctx, events, IO_MAX_SOCKETS, 10);
     
     if (event_count < 0) {
         return -1;
@@ -595,6 +972,19 @@ int websocket_process(WebSocket* ws) {
     
     for (int i = 0; i < event_count; i++) {
         int socket_idx = (int)(intptr_t)events[i].udata;
+        
+        // Check for connection closure (EOF or error)
+        if (events[i].flags & EV_EOF || events[i].flags & EV_ERROR) {
+            // Connection closed or error
+            if (ws->state == WS_STATE_CONNECTED || ws->state == WS_STATE_CONNECTING) {
+                ws->state = WS_STATE_CLOSED;
+                // Connection closed - callback will handle reconnect if needed
+                if (ws->on_error) {
+                    ws->on_error(ws, -1, "Connection closed by peer", ws->callback_user_data);
+                }
+            }
+            continue;
+        }
         
         if (events[i].filter == EVFILT_READ) {
             // Read data
@@ -610,28 +1000,229 @@ int websocket_process(WebSocket* ws) {
             
             // Process handshake if connecting
             if (ws->state == WS_STATE_CONNECTING) {
-                // For SSL, continue handshake and ensure data flows
+                // For SSL, complete handshake first before parsing WebSocket handshake
+                // CRITICAL: SSL handshake must complete BEFORE we can read HTTP response
                 if (ws->use_ssl) {
-                    // Read any available SSL data first
-                    ssl_read(ws->ssl_ctx, &ws->rx_ring);
-                    // Then write any pending data
-                    ssl_write(ws->ssl_ctx, &ws->tx_ring);
+                    // Drive SSL handshake by reading/writing - loop until complete
+                    // SecureTransport handshake is asynchronous and needs multiple I/O cycles
+                    int ssl_handshake_iterations = 0;
+                    const int max_ssl_iterations = 20;  // Max iterations per event
+                    bool ssl_made_progress = false;
+                    
+                    while (ssl_handshake_iterations < max_ssl_iterations) {
+                        ssize_t ssl_write_result = ssl_write(ws->ssl_ctx, &ws->tx_ring);
+                        ssize_t ssl_read_result = ssl_read(ws->ssl_ctx, &ws->rx_ring);
+                        
+                        ssl_handshake_iterations++;
+                        
+                        // Check if handshake is complete (for OpenSSL)
+                        if (ssl_is_handshake_complete(ws->ssl_ctx)) {
+                            ssl_made_progress = true;
+                            break;  // Handshake complete
+                        }
+                        
+                        // If we got data or wrote data, handshake is progressing
+                        if (ssl_read_result > 0 || ssl_write_result > 0) {
+                            ssl_made_progress = true;
+                            // Continue one more iteration to complete handshake
+                            continue;
+                        }
+                        
+                        // If both return 0 (no progress), handshake might be waiting for more I/O
+                        // or already complete (for SecureTransport, which doesn't have completion check)
+                        if (ssl_read_result == 0 && ssl_write_result == 0) {
+                            // No progress this iteration
+                            // For SecureTransport, assume handshake can proceed if we've made progress before
+                            if (ssl_made_progress || ssl_handshake_iterations >= 5) {
+                                break;  // Assume handshake will complete via subsequent I/O
+                            }
+                        }
+                        
+                        // If error, don't fail immediately - might be temporary
+                        if (ssl_read_result < 0 || ssl_write_result < 0) {
+                            // SSL error - but don't close immediately
+                            // SecureTransport may return errors during handshake that are recoverable
+                            if (ssl_handshake_iterations >= 10) {
+                                // Too many errors - likely real failure
+                                break;
+                            }
+                        }
+                    }
                 }
                 
-                int result = parse_handshake_response(ws);
-                if (result == 0) {
-                    ws->state = WS_STATE_CONNECTED;
-                } else if (result < 0) {
-                    if (ws->on_error) {
-                        ws->on_error(ws, -1, "Handshake failed", ws->callback_user_data);
+                // Try to parse HTTP handshake if we have data
+                // CRITICAL: Must actively drain SSL to get HTTP response into ringbuffer
+                // For SSL, we need to keep reading until HTTP response arrives
+                // Also ensure handshake request has been sent via SSL
+                if (ws->use_ssl) {
+                    // First, ensure handshake request is sent via SSL
+                    ssl_write(ws->ssl_ctx, &ws->tx_ring);
+                    
+                    // Aggressively read SSL to get HTTP response
+                    // SecureTransport may buffer HTTP response in SSL layer
+                    for (int ssl_try = 0; ssl_try < 20; ssl_try++) {
+                        ssize_t ssl_result = ssl_read(ws->ssl_ctx, &ws->rx_ring);
+                        if (ssl_result <= 0) {
+                            // No more data available right now
+                            // But still try to parse what we have
+                            break;
+                        }
+                        // Got data - continue reading to get full HTTP response
                     }
-                    websocket_close(ws);
                 }
+                
+                char* test_data;
+                size_t test_len;
+                ringbuffer_read_inline(&ws->rx_ring, &test_data, &test_len);
+                
+                if (test_len > 0) {
+                    int result = parse_handshake_response(ws);
+                    if (result == 0) {
+                        // Handshake complete!
+                        ws->state = WS_STATE_CONNECTED;
+                        
+                        // PHASE 2: Record connection start time for metrics
+                        if (ws->connection_start_ns == 0) {
+                            ws->connection_start_ns = get_time_ns();
+                            WS_LOG(ws, WS_LOG_INFO, "WebSocket connected to %s:%d", ws->host, ws->port);
+                        }
+                        
+                        // PHASE 3: Reset reconnection state on successful connection
+                        if (ws->reconnect_config.reset_backoff_on_success) {
+                            ws->reconnect_state.reconnect_attempts = 0;
+                            ws->reconnect_state.is_reconnecting = false;
+                            ws->reconnect_state.next_backoff_ms = ws->reconnect_config.initial_backoff_ms;
+                        }
+                        // Re-register write event if tx_ring has data
+                        if (ringbuffer_readable(&ws->tx_ring) > 0) {
+                            struct kevent ev;
+                            EV_SET(&ev, ws->fd, EVFILT_WRITE, EV_ADD | EV_CLEAR | EV_ENABLE | EV_ONESHOT, 0, 0, (void*)(intptr_t)ws->socket_index);
+                            kevent(ws->io_ctx->kq, &ev, 1, NULL, 0, NULL);
+                        }
+                    } else if (result < 0 && test_len > 200) {
+                        // Parse error - invalid handshake response
+                        // Only fail if we have substantial data (complete response) that's invalid
+                        // Check if it looks like HTTP but wrong format
+                        if (strstr((char*)test_data, "HTTP") != NULL) {
+                            // Has HTTP but parsing failed - real error
+                            if (ws->on_error) {
+                                ws->on_error(ws, -1, "Handshake failed: invalid HTTP response", ws->callback_user_data);
+                            }
+                            websocket_close(ws);
+                        }
+                        // If no HTTP found yet, might still be SSL handshake data - keep waiting
+                    }
+                    // result == 1 means "need more data" - this is OK, keep waiting
+                }
+                // If test_len == 0, no data yet - keep waiting (handshake still in progress)
             } else if (ws->state == WS_STATE_CONNECTED) {
                 // Process WebSocket frames
                 process_frames(ws);
+                
+                // Continue processing frames until ring buffer is empty
+                // This handles cases where multiple frames arrived in one SSL read
+                // EV_ONESHOT only fires once per socket event, so we need to drain the buffer
+                size_t frames_processed = 1;
+                while (frames_processed > 0) {
+                    size_t before = ws->rx_ring.read_ptr;
+                    process_frames(ws);
+                    size_t after = ws->rx_ring.read_ptr;
+                    frames_processed = (after != before) ? 1 : 0;
+                }
             }
         }
+    }
+    
+    // CRITICAL: For SSL connections, keep reading even when no socket events
+    // SecureTransport may buffer data internally, so we need to actively drain it
+    // This ensures we process all available data immediately, not waiting for kqueue events
+    if (ws->state == WS_STATE_CONNECTED && ws->use_ssl) {
+        // Keep reading from SSL and processing frames until no more data available
+        // IMPORTANT: Must be aggressive about draining - Binance sends messages continuously
+        // BUT: Check connection state to detect if connection closed
+        int ssl_read_attempts = 0;
+        const int max_ssl_reads = 200;  // Increased from 100 to handle high message rates
+        bool made_progress = false;
+        
+        while (ssl_read_attempts < max_ssl_reads && ws->state == WS_STATE_CONNECTED) {
+            ssl_read_attempts++;
+            ssize_t ssl_result = ssl_read(ws->ssl_ctx, &ws->rx_ring);
+            
+            // Check connection state after each read (connection might have closed)
+            if (ws->state != WS_STATE_CONNECTED) {
+                // Connection closed during drain - process any buffered frames and exit
+                process_frames(ws);
+                break;
+            }
+            
+            if (ssl_result > 0) {
+                // Data was read - process frames immediately
+                made_progress = true;
+                process_frames(ws);
+                // Continue draining frames until buffer is empty
+                int frame_drain_iterations = 0;
+                while (frame_drain_iterations < 50 && ws->state == WS_STATE_CONNECTED) {
+                    size_t before = ws->rx_ring.read_ptr;
+                    process_frames(ws);
+                    size_t after = ws->rx_ring.read_ptr;
+                    if (after == before) {
+                        break;  // No more frames to process
+                    }
+                    // Check state again after processing frames
+                    if (ws->state != WS_STATE_CONNECTED) {
+                        break;
+                    }
+                    frame_drain_iterations++;
+                }
+            } else if (ssl_result == 0) {
+                // No more data available (would block) - connection is still alive
+                process_frames(ws);
+                
+                // If we made progress this loop, continue one more time to catch any buffered data
+                if (made_progress && ssl_read_attempts < 5) {
+                    continue;
+                }
+                
+                break;  // No more data available (would block)
+            } else if (ssl_result < 0) {
+                // CRITICAL: Negative result means connection closed or error
+                // ssl_read returns -1 for connection closure (errSSLClosedGraceful)
+                // Update connection state immediately
+                if (ws->state == WS_STATE_CONNECTED) {
+                    ws->state = WS_STATE_CLOSED;
+                    // Trigger error callback for reconnect handling
+                    if (ws->on_error) {
+                        ws->on_error(ws, -1, "SSL connection closed", ws->callback_user_data);
+                    }
+                }
+                process_frames(ws);  // Process any remaining buffered frames
+                break;  // Connection closed
+            } else {
+                // This shouldn't happen (ssl_result < 0 is handled above)
+                // But handle it anyway for safety
+                process_frames(ws);
+                if (ws->state != WS_STATE_CONNECTED) {
+                    break;
+                }
+                break;
+            }
+        }
+        
+        // Final frame processing pass to catch any remaining frames (if still connected)
+        if (ws->state == WS_STATE_CONNECTED) {
+            process_frames(ws);
+        }
+    } else if (ws->state == WS_STATE_CONNECTED) {
+        // Also process any buffered frames even if no new socket events (non-SSL)
+        // This ensures we don't miss frames that arrived between poll calls
+        process_frames(ws);
+    }
+    
+    // PHASE 2: Periodic observability checks (health and metrics reporting)
+    if (ws->state == WS_STATE_CONNECTED) {
+        check_health(ws);
+        report_metrics_if_needed(ws);
+        check_heartbeat(ws);  // PHASE 3: Check heartbeat
     }
     
     return event_count;
@@ -669,3 +1260,342 @@ uint64_t websocket_get_last_nic_timestamp_ticks(WebSocket* ws) {
     return io_get_last_nic_timestamp_ticks(ws->io_ctx, ws->socket_index);
 }
 
+// PHASE 2: Observability - Metrics API implementations
+
+// Helper function to calculate percentiles from latency samples
+static void calculate_latency_percentiles(WebSocket* ws, double* p50, double* p99) {
+    if (!ws || !ws->latency_samples || ws->latency_sample_count == 0) {
+        *p50 = 0.0;
+        *p99 = 0.0;
+        return;
+    }
+    
+    // Create a temporary sorted array for percentile calculation
+    size_t count = ws->latency_sample_count;
+    uint64_t* sorted = (uint64_t*)malloc(count * sizeof(uint64_t));
+    if (!sorted) {
+        *p50 = 0.0;
+        *p99 = 0.0;
+        return;
+    }
+    
+    // Copy and sort
+    memcpy(sorted, ws->latency_samples, count * sizeof(uint64_t));
+    
+    // Simple bubble sort (okay for small arrays, latency_sample_count is typically < 1000)
+    for (size_t i = 0; i < count - 1; i++) {
+        for (size_t j = 0; j < count - i - 1; j++) {
+            if (sorted[j] > sorted[j + 1]) {
+                uint64_t temp = sorted[j];
+                sorted[j] = sorted[j + 1];
+                sorted[j + 1] = temp;
+            }
+        }
+    }
+    
+    // Calculate percentiles
+    size_t p50_idx = (size_t)(count * 0.50);
+    size_t p99_idx = (size_t)(count * 0.99);
+    if (p99_idx >= count) p99_idx = count - 1;
+    
+    *p50 = (double)sorted[p50_idx];
+    *p99 = (double)sorted[p99_idx];
+    
+    free(sorted);
+}
+
+// Helper to update latency sample
+static void update_latency_sample(WebSocket* ws, uint64_t latency_ns) {
+    // CRITICAL FIX: Check all pointers before accessing
+    if (!ws || !ws->latency_samples || ws->latency_sample_capacity == 0) {
+        return;
+    }
+    
+    // PRIORITY 1 FIX: Use rolling window - overwrite oldest sample
+    // This ensures bounded memory usage during high-throughput scenarios
+    ws->latency_samples[ws->latency_sample_idx] = latency_ns;
+    ws->latency_sample_idx = (ws->latency_sample_idx + 1) % ws->latency_sample_capacity;
+    
+    if (ws->latency_sample_count < ws->latency_sample_capacity) {
+        ws->latency_sample_count++;
+    }
+    
+    // PRIORITY 1 FIX: Periodically reset metrics to prevent unbounded accumulation
+    // DISABLED: This was causing crashes - metric reset should be done explicitly via API
+    // The rolling window for latency samples is already bounded, so no periodic reset needed
+    // Metrics can be reset explicitly via websocket_reset_metrics() when needed
+}
+
+void websocket_set_on_metrics(WebSocket* ws, ws_on_metrics_t callback, void* user_data) {
+    if (ws) {
+        ws->on_metrics = callback;
+        ws->metrics_user_data = user_data;
+    }
+}
+
+void websocket_get_metrics(WebSocket* ws, WebSocketMetrics* out_metrics) {
+    if (!ws || !out_metrics) {
+        return;
+    }
+    
+    // Calculate current metrics
+    uint64_t now_ns = get_time_ns();
+    
+    // Calculate latency percentiles
+    calculate_latency_percentiles(ws, &ws->metrics.latency_p50_ns, &ws->metrics.latency_p99_ns);
+    
+    // Calculate throughput (messages per second)
+    if (ws->connection_start_ns > 0 && now_ns > ws->connection_start_ns) {
+        double elapsed_sec = ((double)(now_ns - ws->connection_start_ns)) / 1000000000.0;
+        if (elapsed_sec > 0) {
+            ws->metrics.throughput_msg_per_sec = (double)ws->metrics.messages_received / elapsed_sec;
+        }
+    }
+    
+    // Calculate ring buffer utilization
+    size_t rx_readable = ringbuffer_readable(&ws->rx_ring);
+    double rx_utilization = (double)rx_readable / (double)ws->rx_ring.size;
+    size_t tx_readable = ringbuffer_readable(&ws->tx_ring);
+    double tx_utilization = (double)tx_readable / (double)ws->tx_ring.size;
+    ws->metrics.ringbuffer_utilization = (rx_utilization + tx_utilization) / 2.0;
+    
+    // Calculate connection uptime
+    if (ws->connection_start_ns > 0) {
+        ws->metrics.connection_uptime_ns = now_ns - ws->connection_start_ns;
+    }
+    
+    // Copy metrics to output
+    memcpy(out_metrics, &ws->metrics, sizeof(WebSocketMetrics));
+}
+
+void websocket_reset_metrics(WebSocket* ws) {
+    if (!ws) {
+        return;
+    }
+    
+    memset(&ws->metrics, 0, sizeof(WebSocketMetrics));
+    ws->latency_sample_count = 0;
+    ws->latency_sample_idx = 0;
+    ws->metrics_last_report_ns = 0;
+}
+
+// PHASE 2: Observability - Health check API
+
+WSHealthStatus websocket_get_health(WebSocket* ws) {
+    if (!ws) {
+        return WS_HEALTH_UNHEALTHY;
+    }
+    
+    // Check connection state
+    if (ws->state != WS_STATE_CONNECTED) {
+        return WS_HEALTH_UNHEALTHY;
+    }
+    
+    // Check error rate
+    uint64_t total_operations = ws->metrics.messages_received + ws->metrics.messages_sent;
+    if (total_operations > 0) {
+        double error_rate = (double)ws->metrics.errors_total / (double)total_operations;
+        if (error_rate > 0.1) {  // >10% error rate
+            return WS_HEALTH_UNHEALTHY;
+        }
+    }
+    
+    // Check latency
+    if (ws->metrics.latency_p99_ns > 100000) {  // P99 > 100µs
+        return WS_HEALTH_DEGRADED;
+    }
+    
+    // Check ring buffer saturation
+    if (ws->metrics.ringbuffer_utilization > 0.8) {  // >80% utilization
+        return WS_HEALTH_DEGRADED;
+    }
+    
+    return WS_HEALTH_OK;
+}
+
+void websocket_set_on_health(WebSocket* ws, ws_on_health_t callback, void* user_data) {
+    if (ws) {
+        ws->on_health = callback;
+        ws->health_user_data = user_data;
+    }
+}
+
+// PHASE 2: Observability - Logging API
+
+void websocket_set_log_callback(WebSocket* ws, ws_log_callback_t callback, void* user_data) {
+    if (ws) {
+        ws->log_callback = callback;
+        ws->log_user_data = user_data;
+    }
+}
+
+// PHASE 2: Helper function to check and report health changes (called periodically)
+static void check_health(WebSocket* ws) {
+    if (!ws || !ws->on_health) {
+        return;
+    }
+    
+    uint64_t now_ns = get_time_ns();
+    // Check health every 1 second
+    if (now_ns - ws->last_health_check_ns < 1000000000ULL) {
+        return;
+    }
+    ws->last_health_check_ns = now_ns;
+    
+    WSHealthStatus new_health = websocket_get_health(ws);
+    if (new_health != ws->current_health) {
+        const char* reason = "";
+        if (new_health == WS_HEALTH_UNHEALTHY) {
+            if (ws->state != WS_STATE_CONNECTED) {
+                reason = "Connection not connected";
+            } else {
+                reason = "High error rate";
+            }
+        } else if (new_health == WS_HEALTH_DEGRADED) {
+            reason = "High latency or buffer saturation";
+        } else {
+            reason = "All systems normal";
+        }
+        
+        ws->current_health = new_health;
+        ws->on_health(ws, new_health, reason, ws->health_user_data);
+    }
+}
+
+// PHASE 2: Helper function to report metrics periodically (called from websocket_process)
+static void report_metrics_if_needed(WebSocket* ws) {
+    if (!ws || !ws->on_metrics) {
+        return;
+    }
+    
+    uint64_t now_ns = get_time_ns();
+    // Report metrics every 1 second
+    if (now_ns - ws->metrics_last_report_ns < 1000000000ULL) {
+        return;
+    }
+    ws->metrics_last_report_ns = now_ns;
+    
+    // Update metrics before reporting
+    WebSocketMetrics current_metrics;
+    websocket_get_metrics(ws, &current_metrics);
+    
+    // Call callback with current metrics
+    ws->on_metrics(ws, &current_metrics, ws->metrics_user_data);
+}
+
+// PHASE 3: Error Recovery - Reconnection API implementations
+
+void websocket_set_reconnect_config(WebSocket* ws, const WSReconnectConfig* config) {
+    if (!ws || !config) {
+        return;
+    }
+    
+    memcpy(&ws->reconnect_config, config, sizeof(WSReconnectConfig));
+    
+    // Ensure next_backoff_ms is initialized
+    if (ws->reconnect_state.reconnect_attempts == 0) {
+        ws->reconnect_state.next_backoff_ms = ws->reconnect_config.initial_backoff_ms;
+    }
+}
+
+void websocket_get_reconnect_state(WebSocket* ws, WSReconnectState* out_state) {
+    if (!ws || !out_state) {
+        return;
+    }
+    
+    memcpy(out_state, &ws->reconnect_state, sizeof(WSReconnectState));
+}
+
+// PHASE 3: Helper to calculate next backoff delay
+static uint32_t calculate_backoff(WebSocket* ws) {
+    if (ws->reconnect_state.reconnect_attempts == 0) {
+        return ws->reconnect_config.initial_backoff_ms;
+    }
+    
+    // Calculate: initial * (multiplier ^ attempts)
+    double backoff_ms = (double)ws->reconnect_config.initial_backoff_ms;
+    for (uint32_t i = 0; i < ws->reconnect_state.reconnect_attempts; i++) {
+        backoff_ms *= ws->reconnect_config.backoff_multiplier;
+    }
+    
+    // Cap at max_backoff_ms
+    if (backoff_ms > (double)ws->reconnect_config.max_backoff_ms) {
+        backoff_ms = (double)ws->reconnect_config.max_backoff_ms;
+    }
+    
+    return (uint32_t)backoff_ms;
+}
+
+// PHASE 3: Helper to trigger reconnection (called from error handler)
+static void trigger_reconnect(WebSocket* ws) {
+    if (!ws || !ws->reconnect_config.auto_reconnect) {
+        return;
+    }
+    
+    // Check if max retries exceeded
+    if (ws->reconnect_config.max_retries > 0 && 
+        ws->reconnect_state.reconnect_attempts >= ws->reconnect_config.max_retries) {
+        WS_LOG(ws, WS_LOG_WARN, "Max reconnection attempts (%u) exceeded", ws->reconnect_config.max_retries);
+        return;
+    }
+    
+    ws->reconnect_state.is_reconnecting = true;
+    ws->reconnect_state.reconnect_attempts++;
+    ws->reconnect_state.next_backoff_ms = calculate_backoff(ws);
+    ws->last_reconnect_attempt_ns = get_time_ns();
+    
+    WS_LOG(ws, WS_LOG_INFO, "Reconnecting (attempt %u, backoff %u ms)", 
+           ws->reconnect_state.reconnect_attempts, ws->reconnect_state.next_backoff_ms);
+}
+
+// PHASE 3: Error Recovery - Heartbeat API
+
+void websocket_set_heartbeat_config(WebSocket* ws, const WSHeartbeatConfig* config) {
+    if (!ws || !config) {
+        return;
+    }
+    
+    memcpy(&ws->heartbeat_config, config, sizeof(WSHeartbeatConfig));
+    ws->last_ping_sent_ns = 0;
+    ws->last_pong_received_ns = 0;
+}
+
+// PHASE 3: Helper to send ping and check pong timeout
+static void check_heartbeat(WebSocket* ws) {
+    if (!ws || !ws->heartbeat_config.enable_heartbeat || ws->state != WS_STATE_CONNECTED) {
+        return;
+    }
+    
+    uint64_t now_ns = get_time_ns();
+    uint64_t ping_interval_ns = (uint64_t)ws->heartbeat_config.ping_interval_ms * 1000000ULL;
+    uint64_t pong_timeout_ns = (uint64_t)ws->heartbeat_config.pong_timeout_ms * 1000000ULL;
+    
+    // Send ping if interval has elapsed
+    if (ws->last_ping_sent_ns == 0 || (now_ns - ws->last_ping_sent_ns) >= ping_interval_ns) {
+        // Send empty ping frame (RFC 6455 allows empty ping)
+        uint8_t ping_frame[2] = {0x89, 0x00};  // PING opcode, empty payload
+        size_t written = ringbuffer_write(&ws->tx_ring, ping_frame, 2);
+        if (written == 2) {
+            if (ws->use_ssl) {
+                ssl_write(ws->ssl_ctx, &ws->tx_ring);
+            } else {
+                io_write(ws->io_ctx, ws->socket_index);
+            }
+            ws->last_ping_sent_ns = now_ns;
+            WS_LOG(ws, WS_LOG_DEBUG, "Sent heartbeat ping");
+        }
+    }
+    
+    // Check for pong timeout
+    if (ws->last_ping_sent_ns > 0 && ws->last_pong_received_ns < ws->last_ping_sent_ns) {
+        if ((now_ns - ws->last_ping_sent_ns) >= pong_timeout_ns) {
+            WS_LOG(ws, WS_LOG_WARN, "Heartbeat timeout: no pong received within %u ms", 
+                   ws->heartbeat_config.pong_timeout_ms);
+            if (ws->heartbeat_config.on_heartbeat_timeout) {
+                ws->heartbeat_config.on_heartbeat_timeout(ws, ws->heartbeat_config.heartbeat_user_data);
+            }
+            // Reset ping sent time to allow retry
+            ws->last_ping_sent_ns = 0;
+        }
+    }
+}

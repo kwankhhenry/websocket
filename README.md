@@ -264,3 +264,4 @@ This library is optimized for HFT use cases on Mac Mini M4. Contributions should
 - Neon SIMD acceleration where applicable
 - Sub-microsecond latency goals
 
+

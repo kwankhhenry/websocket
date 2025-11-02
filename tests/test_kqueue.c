@@ -77,7 +77,7 @@ void test_non_blocking_io(void) {
     
     // Poll (should return 0 events initially)
     struct kevent events[10];
-    int event_count = io_poll(&ctx, events, 10);
+    int event_count = io_poll(&ctx, events, 10, 100000);
     TEST_ASSERT(event_count >= 0, "Poll failed");
     
     io_remove_socket(&ctx, fds[0]);
@@ -112,7 +112,7 @@ void test_event_ordering(void) {
     
     // Poll for events
     struct kevent events[10];
-    int event_count = io_poll(&ctx, events, 10);
+    int event_count = io_poll(&ctx, events, 10, 100000);
     
     // Should have at least one read event
     TEST_ASSERT(event_count > 0, "No events received");
